@@ -6,6 +6,7 @@ module;
 #include <cstdint>
 #include <expected>
 #include <functional>
+#include <mutex>
 #include <string>
 #include <utility>
 
@@ -21,6 +22,58 @@ namespace Dreamhearth
 {
 	namespace
 	{
+		struct GlfwErrorState
+		{
+			std::mutex mutex;
+			std::string last_error;
+			std::string initialization_error;
+			Window::OnErrorFn on_error;
+			bool defer_callback = false;
+		};
+
+		GlfwErrorState & glfw_error_state()
+		{
+			static GlfwErrorState state;
+			return state;
+		}
+
+		void clear_glfw_error()
+		{
+			auto & state = glfw_error_state();
+			std::lock_guard lock{ state.mutex };
+			state.last_error.clear();
+			state.initialization_error.clear();
+			state.defer_callback = true;
+		}
+
+		std::string last_glfw_error()
+		{
+			auto & state = glfw_error_state();
+			std::lock_guard lock{ state.mutex };
+			return state.last_error;
+		}
+
+		void set_initialization_error(std::string error)
+		{
+			auto & state = glfw_error_state();
+			std::lock_guard lock{ state.mutex };
+			state.initialization_error = std::move(error);
+		}
+
+		std::string initialization_error()
+		{
+			auto & state = glfw_error_state();
+			std::lock_guard lock{ state.mutex };
+			return state.initialization_error;
+		}
+
+		void finish_glfw_initialization()
+		{
+			auto & state = glfw_error_state();
+			std::lock_guard lock{ state.mutex };
+			state.defer_callback = false;
+		}
+
 		GLFWmonitor * get_window_monitor(GLFWwindow * window)
 		{
 			int window_x = 0, window_y = 0;
@@ -77,8 +130,17 @@ namespace Dreamhearth
 	{
 		SetOnError(on_error);
 
+		clear_glfw_error();
 		if (!glfwInit())
+		{
+			finish_glfw_initialization();
+			std::string error = last_glfw_error();
+			if (error.empty()) error = "GLFW did not provide an error description.";
+			std::string const message = "Window startup failed\n\nStage: GLFW initialization\nDetails: " + error;
+			set_initialization_error(message);
+			on_error(message);
 			return;
+		}
 		m_glfw_initialized = true;
 
 		glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
@@ -88,6 +150,7 @@ namespace Dreamhearth
 		glfwWindowHint(GLFW_DECORATED, GLFW_FALSE);
 #endif
 
+		clear_glfw_error();
 		m_window = glfwCreateWindow(
 			window_size_screen_coords.width,
 			window_size_screen_coords.height,
@@ -95,7 +158,21 @@ namespace Dreamhearth
 			nullptr,
 			nullptr);
 		if (!m_window)
+		{
+			finish_glfw_initialization();
+			std::string error = last_glfw_error();
+			if (error.empty()) error = "GLFW did not provide an error description.";
+			std::string const message =
+				"Window startup failed\n\n"
+				"Stage: Creating the Vulkan window\n"
+				"Requested: " + std::to_string(window_size_screen_coords.width) + " × " +
+				std::to_string(window_size_screen_coords.height) + "\n"
+				"Details: " + error;
+			set_initialization_error(message);
+			on_error(message);
 			return;
+		}
+		finish_glfw_initialization();
 
 		WindowRect & r = m_stored_win_rect;
 		glfwGetWindowPos(m_window, &r.x, &r.y);
@@ -119,6 +196,11 @@ namespace Dreamhearth
 		glfwSetWindowIcon(m_window, 1, &icon);
 	}
 
+	std::string Window::GetInitializationError() const
+	{
+		return initialization_error();
+	}
+
 	WindowSize Window::GetWindowSizePixels() const
 	{
 		int width_pixels = 0, height_pixels = 0;
@@ -135,19 +217,29 @@ namespace Dreamhearth
 
 	void Window::SetOnError(OnErrorFn on_error)
 	{
-		// the error callback might be called before the window has been created, so the
-		// glfwSetWindowUserPointer approach doesn't work here, we need a static variable instead
-		static OnErrorFn error_callback_fn;
+		// GLFW accepts a plain C function pointer, so keep callback state at static
+		// lifetime rather than capturing this or a local std::function.
+		auto & state = glfw_error_state();
+		{
+			std::lock_guard lock{ state.mutex };
+			state.on_error = std::move(on_error);
+		}
 
-		error_callback_fn = [on_error](std::string msg)
-			{
-				on_error(std::move(msg));
-			};
-		
 		glfwSetErrorCallback([](int error, const char * description)
 			{
-				if (error_callback_fn)
-					error_callback_fn("GLFW Error: " + std::to_string(error) + " " + description);
+				std::string message = "GLFW Error: " + std::to_string(error) + " " +
+					(description ? description : "(no description)");
+				auto & state = glfw_error_state();
+				Window::OnErrorFn on_error;
+				bool defer_callback = false;
+				{
+					std::lock_guard lock{ state.mutex };
+					state.last_error = message;
+					on_error = state.on_error;
+					defer_callback = state.defer_callback;
+				}
+				if (on_error && !defer_callback)
+					on_error(std::move(message));
 			});
 	}
 

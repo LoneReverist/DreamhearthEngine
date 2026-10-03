@@ -47,6 +47,7 @@ namespace Dreamhearth
 		~Window();
 
 		bool IsValid() const { return m_glfw_initialized && m_window != nullptr; }
+		std::string GetInitializationError() const;
 
 		// Packed RGBA pixels, top-left origin; copied before return. Main thread only.
 		void SetIcon(int width, int height, unsigned char * rgba_pixels);
